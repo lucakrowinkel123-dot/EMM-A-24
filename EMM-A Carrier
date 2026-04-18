@@ -4,6 +4,10 @@
 // ============= Commands ==============
 // Nav;GPS:Name:X:Y:Z:|Ux,Uy,Uz,Fx,Fy,Fz : set target position and orientation vectors
 // Nav;GPS:Name:X:Y:Z:|Faceup,Faceforward  : auto-derive up/forward toward target
+// Nav;GPS:Name:X:Y:Z:|FlipBurn            : physics flip-and-burn (SDX forward-only thrusters)
+//                                           accelerates toward target, flips when
+//                                           v²/(2·a_max) >= remaining distance, coasts through
+//                                           the 180° rotation, then brakes to a halt.
 // stop         : disable autopilot and release controls
 // start        : enable autopilot (requires a target)
 // clear        : clear target and all path state
@@ -18,8 +22,15 @@
 //                path into the next Asteroid Record slot across "EMM-A Ca Asteroid DB Axx"
 //                timers (asteroidsPerDb records each). Also updates "EMM-A Ca Zone DB".
 //                Sends PathClear to the miner after saving.
+//                Park carrier 150 m above the asteroid (forward+backward unobstructed) first.
 // LoadAsteroid <n> : load the path records from the saved Asteroid record <n> (e.g. 002)
 //                    into the miner's "EMM-A Mi Path" timer, replacing its current content.
+// GoTo <n>     : collision-aware 2-waypoint approach to saved asteroid <n>.
+//                Picks A (1 km in front) or B (1 km behind) the saved carrier pos based on
+//                whether the direct line from the current position crosses a 750 m bubble
+//                centred 500 m below the saved carrier pos (roughly where the asteroid is).
+//                Flies to the chosen point via FlipBurn, then aligns to the saved carrier
+//                pos+orientation. Example: GoTo 032
 // =====================================
 
 // ========== Editable Script Settings ==========
@@ -59,6 +70,8 @@ bool autopilotEnabled    = false;
 Vector3D desiredForward  = Vector3D.Zero;
 Vector3D desiredUp       = Vector3D.Zero;
 double activeMaxSpeed    = 0;
+bool flipBurnMode        = false;
+bool flipBurnFlipped     = false;
 
 bool pathMode            = false;
 bool pathPaused          = false;
@@ -177,9 +190,30 @@ void Move()
     Vector3D worldOffset = GetTargetOffsetWorld();
     Vector3D position    = rc.GetPosition() + worldOffset;
     Vector3D toTarget    = targetPosition - position;
+    double distToTarget  = toTarget.Length();
+
+    // FlipBurn: physics-based flip trigger — flip when stopping distance >= remaining distance
+    if (flipBurnMode && !flipBurnFlipped && distToTarget > 0.001)
+    {
+        double maxThrust = ComputeMaxForwardThrust();
+        double mass      = rc.CalculateShipMass().TotalMass;
+        double aMax      = (mass > 0 && maxThrust > 0) ? maxThrust / mass : 1.0;
+        Vector3D myVel   = rc.GetShipVelocities().LinearVelocity;
+        double velTwd    = Math.Max(0, Vector3D.Dot(myVel, toTarget / distToTarget));
+        double stopDist  = (velTwd * velTwd) / (2.0 * aMax);
+        if (distToTarget <= stopDist * 1.2 + 5.0)
+            flipBurnFlipped = true;
+    }
 
     Vector3D forward = desiredForward;
-    if (forward == Vector3D.Zero && toTarget.LengthSquared() > 0.001)
+    if (flipBurnMode)
+    {
+        // Pre-flip: face target.  Post-flip: face away from target (retrograde).
+        Vector3D refDir = flipBurnFlipped ? -toTarget : toTarget;
+        if (refDir.LengthSquared() > 0.001)
+            forward = Vector3D.Normalize(refDir);
+    }
+    else if (forward == Vector3D.Zero && toTarget.LengthSquared() > 0.001)
         forward = Vector3D.Normalize(toTarget);
 
     Vector3D up = desiredUp;
@@ -200,14 +234,49 @@ void Move()
     if (atPosition)
     {
         thrust.Reset();
-        if (aligned)
-            gyros.Reset();
+        if (aligned) { gyros.Reset(); flipBurnMode = false; }
         return;
+    }
+
+    // Coast (no thrust) while rotating after the flip
+    if (flipBurnMode && flipBurnFlipped && !aligned)
+    {
+        thrust.Reset();
+        return;
+    }
+
+    // Post-flip deceleration: brake hard until velocity toward target is low
+    if (flipBurnMode && flipBurnFlipped)
+    {
+        Vector3D myVel = rc.GetShipVelocities().LinearVelocity;
+        double velTwd  = distToTarget > 0.001
+            ? Vector3D.Dot(myVel, toTarget / distToTarget)
+            : 0;
+        if (velTwd > 1.0)
+        {
+            thrust.ApplyAccel(thrust.ControlVelocity(Vector3D.Zero));
+            return;
+        }
+        flipBurnMode = false; // velocity low enough — hand off to normal PID for final approach
     }
 
     double maxSpeedNow = activeMaxSpeed > 0 ? activeMaxSpeed : maxSpeed;
     Vector3D rcTarget  = targetPosition - worldOffset;
     thrust.ApplyAccel(thrust.ControlPosition(rcTarget, Vector3D.Zero, maxSpeedNow));
+}
+
+double ComputeMaxForwardThrust()
+{
+    Vector3D shipFwd = rc.WorldMatrix.Forward;
+    double total = 0;
+    foreach (IMyThrust t in allThrusters)
+    {
+        if (!t.IsFunctional) continue;
+        // Forward thrusters have intake facing aft (WorldMatrix.Forward ≈ -shipFwd)
+        if (Vector3D.Dot(t.WorldMatrix.Forward, shipFwd) < -0.5)
+            total += t.MaxEffectiveThrust;
+    }
+    return total;
 }
 
 Vector3D GetTargetOffsetWorld()
@@ -249,13 +318,16 @@ void RemoteCommand(string command)
     if (trimmed.StartsWith("Nav;", StringComparison.OrdinalIgnoreCase))
     {
         string navArgs = trimmed.Substring(4).Trim();
-        if (!TryParseGpsCommand(navArgs, out targetPosition, out desiredForward, out desiredUp))
+        bool flipBurn;
+        if (!TryParseGpsCommand(navArgs, out targetPosition, out desiredForward, out desiredUp, out flipBurn))
         {
             Echo("Invalid Nav command. Use: Nav;GPS:Name:X:Y:Z:|Faceup,Faceforward");
             return;
         }
         hasTarget        = true;
         autopilotEnabled = true;
+        flipBurnMode     = flipBurn;
+        flipBurnFlipped  = false;
         WriteEcho();
         return;
     }
@@ -276,6 +348,12 @@ void RemoteCommand(string command)
     if (trimmed.StartsWith("loadasteroid ", StringComparison.OrdinalIgnoreCase))
     {
         LoadAsteroid(trimmed);
+        return;
+    }
+
+    if (trimmed.StartsWith("goto ", StringComparison.OrdinalIgnoreCase))
+    {
+        ExecuteGoTo(trimmed.Substring(5).Trim());
         return;
     }
 
@@ -302,6 +380,8 @@ void RemoteCommand(string command)
             pathRecords.Clear();
             pathIndex           = 0;
             activeMaxSpeed      = 0;
+            flipBurnMode        = false;
+            flipBurnFlipped     = false;
             ResetMovement();
             WriteEcho();
             break;
@@ -437,13 +517,16 @@ bool ExecutePathRecord(string rawRecord)
     if (navCmd != null)
     {
         Vector3D gps, forward, up;
-        if (!TryParseGpsCommand(navCmd, out gps, out forward, out up))
+        bool flipBurn;
+        if (!TryParseGpsCommand(navCmd, out gps, out forward, out up, out flipBurn))
             return false;
         targetPosition   = gps;
         desiredForward   = forward;
         desiredUp        = up;
         hasTarget        = true;
         autopilotEnabled = true;
+        flipBurnMode     = flipBurn;
+        flipBurnFlipped  = false;
         return true;
     }
 
@@ -853,6 +936,128 @@ List<string> ExtractAsteroidPathLines(string dbContent, int asteroidNum)
     return result;
 }
 
+// ---- GoTo ----
+
+void ExecuteGoTo(string argument)
+{
+    // Strip non-digit characters from the end (e.g. trailing '>')
+    string numStr = argument.Trim();
+    int endIdx = numStr.Length;
+    while (endIdx > 0 && !char.IsDigit(numStr[endIdx - 1]))
+        endIdx--;
+    numStr = numStr.Substring(0, endIdx).Trim();
+
+    int asteroidNum;
+    if (!int.TryParse(numStr, out asteroidNum) || asteroidNum < 1)
+    {
+        Echo($"GoTo: invalid asteroid number '{argument.Trim()}'.");
+        return;
+    }
+
+    Vector3D savedPos, savedFwd, savedUp;
+    if (!TryLoadAsteroidCarrierGps(asteroidNum, out savedPos, out savedFwd, out savedUp))
+    {
+        Echo($"GoTo: could not load carrier GPS for Asteroid {asteroidNum:D3}.");
+        return;
+    }
+
+    Vector3D A             = savedPos + savedFwd * 1000;
+    Vector3D B             = savedPos - savedFwd * 1000;
+    Vector3D bubbleCenter  = savedPos - savedUp  * 500;
+    double   bubbleRadius  = 750;
+    Vector3D currentPos    = rc.GetPosition();
+
+    bool hitsA = SegmentIntersectsSphere(currentPos, A, bubbleCenter, bubbleRadius);
+    bool hitsB = SegmentIntersectsSphere(currentPos, B, bubbleCenter, bubbleRadius);
+
+    if (hitsA && hitsB)
+    {
+        Echo("GoTo: both approach lines cross the asteroid bubble. Navigate manually.");
+        return;
+    }
+
+    Vector3D approachPoint = hitsA ? B : A;
+    string   approachLabel = hitsA ? "B (behind)" : "A (front)";
+    Echo($"GoTo: Asteroid {asteroidNum:D3} — using approach point {approachLabel}.");
+
+    string approachRecord = string.Format(
+        "Nav;GPS:Approach:{0:0.00}:{1:0.00}:{2:0.00}:|FlipBurn",
+        approachPoint.X, approachPoint.Y, approachPoint.Z);
+
+    string dockRecord = string.Format(
+        "Nav;GPS:Carrier:{0:0.00}:{1:0.00}:{2:0.00}:|{3:0.0000},{4:0.0000},{5:0.0000},{6:0.0000},{7:0.0000},{8:0.0000}",
+        savedPos.X, savedPos.Y, savedPos.Z,
+        savedUp.X,  savedUp.Y,  savedUp.Z,
+        savedFwd.X, savedFwd.Y, savedFwd.Z);
+
+    pathRecords         = new List<string> { approachRecord, dockRecord };
+    pathIndex           = 0;
+    pathMode            = true;
+    pathPaused          = false;
+    pathPausedNavResume = false;
+    autopilotEnabled    = false;
+    hasTarget           = false;
+    StartNextPathRecord();
+}
+
+bool TryLoadAsteroidCarrierGps(int asteroidNum, out Vector3D pos, out Vector3D fwd, out Vector3D up)
+{
+    pos = Vector3D.Zero;
+    fwd = Vector3D.Zero;
+    up  = Vector3D.Zero;
+
+    int dbIndex       = (asteroidNum - 1) / asteroidsPerDb + 1;
+    string dbTimerName = asteroidDbTagPfx + dbIndex.ToString("D2");
+    IMyTimerBlock dbTimer = FindTimerByTag(dbTimerName);
+    if (dbTimer == null) return false;
+
+    string label  = asteroidNum.ToString("D3");
+    string[] lines = (dbTimer.CustomData ?? "").Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+    bool inRecord     = false;
+    bool carrierNext  = false;
+    foreach (string rawLine in lines)
+    {
+        string line = rawLine.Trim();
+        if (!inRecord)
+        {
+            if (string.Equals(line, "Asteroid " + label, StringComparison.OrdinalIgnoreCase))
+                inRecord = true;
+        }
+        else
+        {
+            if (line == asteroidHeaderLine && inRecord)
+                break; // start of next record without finding it
+            if (string.Equals(line, "Carrier pos:", StringComparison.OrdinalIgnoreCase))
+            {
+                carrierNext = true;
+                continue;
+            }
+            if (carrierNext && line.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
+            {
+                bool flipBurnDummy;
+                return TryParseGpsCommand(line, out pos, out fwd, out up, out flipBurnDummy);
+            }
+        }
+    }
+    return false;
+}
+
+bool SegmentIntersectsSphere(Vector3D p0, Vector3D p1, Vector3D center, double radius)
+{
+    Vector3D d = p1 - p0;
+    Vector3D f = p0 - center;
+    double a   = Vector3D.Dot(d, d);
+    if (a < 1e-10) return Vector3D.Distance(p0, center) <= radius;
+    double b   = 2 * Vector3D.Dot(f, d);
+    double c   = Vector3D.Dot(f, f) - radius * radius;
+    double disc = b * b - 4 * a * c;
+    if (disc < 0) return false;
+    double sqrtDisc = Math.Sqrt(disc);
+    double t1 = (-b - sqrtDisc) / (2 * a);
+    double t2 = (-b + sqrtDisc) / (2 * a);
+    return t1 <= 1.0 && t2 >= 0.0;
+}
+
 // Appends one asteroid entry to the Zone DB timer.
 // A new section header (DB timer name) is inserted whenever a new DB block starts.
 void UpdateZoneDb(int asteroidNum, string dbTimerName, string carrierGps)
@@ -913,6 +1118,8 @@ void SaveState()
     sb.AppendLine("desiredForward="     + V3ToString(desiredForward));
     sb.AppendLine("desiredUp="          + V3ToString(desiredUp));
     sb.AppendLine("activeMaxSpeed="     + activeMaxSpeed.ToString("R"));
+    sb.AppendLine("flipBurnMode="       + (flipBurnMode ? "1" : "0"));
+    sb.AppendLine("flipBurnFlipped="    + (flipBurnFlipped ? "1" : "0"));
     sb.AppendLine("pathMode="           + (pathMode ? "1" : "0"));
     sb.AppendLine("pathPaused="         + (pathPaused ? "1" : "0"));
     sb.AppendLine("pathPausedNavResume=" + (pathPausedNavResume ? "1" : "0"));
@@ -947,6 +1154,8 @@ void LoadState()
     if (dict.TryGetValue("desiredForward",      out s) && TryParseV3(s, out v)) desiredForward  = v;
     if (dict.TryGetValue("desiredUp",           out s) && TryParseV3(s, out v)) desiredUp       = v;
     if (dict.TryGetValue("activeMaxSpeed",      out s) && double.TryParse(s, out d)) activeMaxSpeed = d;
+    if (dict.TryGetValue("flipBurnMode",        out s)) flipBurnMode        = s == "1";
+    if (dict.TryGetValue("flipBurnFlipped",     out s)) flipBurnFlipped     = s == "1";
     if (dict.TryGetValue("pathMode",            out s)) pathMode            = s == "1";
     if (dict.TryGetValue("pathPaused",          out s)) pathPaused          = s == "1";
     if (dict.TryGetValue("pathPausedNavResume", out s)) pathPausedNavResume = s == "1";
@@ -966,11 +1175,12 @@ void LoadState()
 
 // ---- Parse helpers ----
 
-bool TryParseGpsCommand(string command, out Vector3D gps, out Vector3D forward, out Vector3D up)
+bool TryParseGpsCommand(string command, out Vector3D gps, out Vector3D forward, out Vector3D up, out bool flipBurn)
 {
-    gps     = Vector3D.Zero;
-    forward = Vector3D.Zero;
-    up      = Vector3D.Zero;
+    gps      = Vector3D.Zero;
+    forward  = Vector3D.Zero;
+    up       = Vector3D.Zero;
+    flipBurn = false;
 
     string[] parts     = command.Split('|');
     string gpsPart     = parts[0];
@@ -1020,6 +1230,10 @@ bool TryParseGpsCommand(string command, out Vector3D gps, out Vector3D forward, 
                     up = Vector3D.Normalize(-gravity);
                 else
                     up = rc.WorldMatrix.Up;
+            }
+            else if (mode == "flipburn")
+            {
+                flipBurn = true;
             }
         }
     }
