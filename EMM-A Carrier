@@ -20,6 +20,11 @@
 //                Sends PathClear to the miner after saving.
 // LoadAsteroid <n> : load the path records from the saved Asteroid record <n> (e.g. 002)
 //                    into the miner's "EMM-A Mi Path" timer, replacing its current content.
+// GoTo <n>         : fly safely to the saved carrier position for asteroid <n>.
+//                    Computes a waypoint 1000 m in front of or behind the saved carrier pos,
+//                    avoiding the 750 m exclusion bubble centred 150 m below the saved pos.
+//                    Sends the waypoint to the Flip-and-Burn navigation PB to travel there,
+//                    then uses carrier autopilot to fly to the saved pos and align.
 // =====================================
 
 // ========== Editable Script Settings ==========
@@ -43,6 +48,7 @@ string asteroidDbTagPfx  = "EMM-A Ca Asteroid DB "; // prefix for Asteroid DB ti
 string zoneDbTimerTag    = "EMM-A Ca Zone DB";     // exact name of the Zone DB timer
 string minerContainerTag = "EMM-A Mi ";            // name tag for miner cargo containers
 string minerPbTag        = "EMM-A Mi Prog. Block (Miner)";          // name tag for the miner's programmable block
+string navPbTag          = "EMM-A Mi Prog. Block (Navigation)";     // name tag for the Flip-and-Burn navigation PB
 string asteroidHeaderLine = "------------------------------------------------------------------------------------------------";
 // =============================================
 
@@ -65,6 +71,13 @@ bool pathPaused          = false;
 bool pathPausedNavResume = false;
 List<string> pathRecords = new List<string>();
 int pathIndex            = 0;
+
+bool     goToMode        = false;
+int      goToPhase       = 0;         // 0=nav-PB flying, 1=carrier flying to final, 2=aligning
+Vector3D goToIntermediate = Vector3D.Zero;
+Vector3D goToFinalPos    = Vector3D.Zero;
+Vector3D goToFinalFwd    = Vector3D.Zero;
+Vector3D goToFinalUp     = Vector3D.Zero;
 
 double secondsPerTick  = 1.0 / 60.0;
 readonly int echoFrequency = 100;
@@ -123,7 +136,10 @@ public void Main(string argument, UpdateType updateSource)
         else
             ResetMovement();
 
-        UpdatePathRunner();
+        if (goToMode)
+            UpdateGoTo();
+        else
+            UpdatePathRunner();
         runtime++;
     }
     else
@@ -165,6 +181,11 @@ void WriteEcho()
     sb.AppendLine($"Path tolerance: {arrivalTolerance:0.00} m");
     sb.AppendLine($"Orientation tolerance: {orientationToleranceDeg:0.00} deg");
     sb.AppendLine($"TOFF R/U/F: {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
+    if (goToMode)
+    {
+        string phase = goToPhase == 0 ? "flip-burn to waypoint" : goToPhase == 1 ? "approach" : "aligning";
+        sb.AppendLine($"GoTo: phase {goToPhase} ({phase})");
+    }
     if (pathMode)
         sb.AppendLine($"Path: {Math.Min(pathIndex + 1, pathRecords.Count)}/{pathRecords.Count}" + (pathPaused ? " (paused)" : ""));
     sb.AppendLine($"Connector: {(carrierConnector != null ? carrierConnector.CustomName : "<missing>")}");
@@ -276,6 +297,12 @@ void RemoteCommand(string command)
     if (trimmed.StartsWith("loadasteroid ", StringComparison.OrdinalIgnoreCase))
     {
         LoadAsteroid(trimmed);
+        return;
+    }
+
+    if (trimmed.StartsWith("goto ", StringComparison.OrdinalIgnoreCase))
+    {
+        ExecuteGoTo(trimmed);
         return;
     }
 
@@ -814,6 +841,178 @@ void LoadAsteroid(string argument)
     Echo($"LoadAsteroid: Asteroid {label} loaded to miner path timer ({pathLines.Count} records).");
 }
 
+// ---- GoTo ----
+
+// GoTo <n>: fly safely to a previously saved asteroid carrier position.
+// Computes a safe intermediate waypoint 1000 m in front of or behind the saved pos,
+// avoiding the 750 m exclusion bubble around the asteroid (150 m below the saved pos).
+// Uses the Flip-and-Burn navigation PB for the long leg, then carrier autopilot for docking.
+void ExecuteGoTo(string argument)
+{
+    string[] parts = argument.Split(new[] { ' ' }, 2, StringSplitOptions.RemoveEmptyEntries);
+    if (parts.Length < 2)
+    {
+        Echo("Usage: GoTo <number>  e.g. GoTo 032");
+        return;
+    }
+    int asteroidNum;
+    if (!int.TryParse(parts[1].Trim(), out asteroidNum) || asteroidNum < 1)
+    {
+        Echo($"GoTo: invalid number '{parts[1].Trim()}'.");
+        return;
+    }
+
+    string carrierGpsStr = FindAsteroidCarrierGps(asteroidNum);
+    if (carrierGpsStr == null)
+    {
+        Echo($"GoTo: Asteroid {asteroidNum:D3} not found in Zone DB.");
+        return;
+    }
+
+    Vector3D savedPos, savedFwd, savedUp;
+    if (!TryParseGpsCommand(carrierGpsStr, out savedPos, out savedFwd, out savedUp))
+    {
+        Echo("GoTo: failed to parse carrier GPS from Zone DB.");
+        return;
+    }
+    if (savedFwd.LengthSquared() < 0.001 || savedUp.LengthSquared() < 0.001)
+    {
+        Echo("GoTo: saved carrier GPS has no orientation data.");
+        return;
+    }
+
+    Vector3D pointA      = savedPos + savedFwd * 1000.0;
+    Vector3D pointB      = savedPos - savedFwd * 1000.0;
+    Vector3D bubbleCenter = savedPos - savedUp * 150.0;
+    const double bubbleRadius = 750.0;
+
+    Vector3D carrierPos = rc.GetPosition();
+    bool aBlocked = LineSegmentIntersectsSphere(carrierPos, pointA, bubbleCenter, bubbleRadius);
+    bool bBlocked = LineSegmentIntersectsSphere(carrierPos, pointB, bubbleCenter, bubbleRadius);
+
+    Vector3D chosen;
+    string choiceLabel;
+    if (!aBlocked)
+    {
+        chosen     = pointA;
+        choiceLabel = "front (+fwd)";
+    }
+    else if (!bBlocked)
+    {
+        chosen     = pointB;
+        choiceLabel = "rear (-fwd)";
+    }
+    else
+    {
+        Echo("GoTo: ERROR - both approach paths intersect the asteroid exclusion zone. Reposition and retry.");
+        return;
+    }
+
+    goToMode        = true;
+    goToPhase       = 0;
+    goToIntermediate = chosen;
+    goToFinalPos    = savedPos;
+    goToFinalFwd    = savedFwd;
+    goToFinalUp     = savedUp;
+
+    autopilotEnabled = false;
+    hasTarget        = false;
+    ResetMovement();
+
+    string gpsCmd = $"GPS:GoToWaypoint:{chosen.X:0.00}:{chosen.Y:0.00}:{chosen.Z:0.00}:";
+    SendNavCommand(gpsCmd);
+    SendNavCommand("engage");
+
+    Echo($"GoTo: heading to Asteroid {asteroidNum:D3} via {choiceLabel} waypoint. Flip-and-Burn engaged.");
+}
+
+void UpdateGoTo()
+{
+    if (!goToMode) return;
+
+    if (goToPhase == 0)
+    {
+        if (IsAtTargetPosition(goToIntermediate))
+        {
+            goToPhase        = 1;
+            targetPosition   = goToFinalPos;
+            desiredForward   = Vector3D.Zero;   // auto-face toward target in Move()
+            desiredUp        = goToFinalUp;
+            hasTarget        = true;
+            autopilotEnabled = true;
+            Echo("GoTo: intermediate waypoint reached. Beginning final approach...");
+        }
+    }
+    else if (goToPhase == 1)
+    {
+        if (IsAtTargetPosition(goToFinalPos))
+        {
+            goToPhase      = 2;
+            desiredForward = goToFinalFwd;
+            Echo("GoTo: final position reached. Aligning to saved orientation...");
+        }
+    }
+    else if (goToPhase == 2)
+    {
+        if (IsAtTargetPose(goToFinalPos, goToFinalFwd, goToFinalUp))
+        {
+            goToMode         = false;
+            autopilotEnabled = false;
+            hasTarget        = false;
+            ResetMovement();
+            Echo("GoTo: arrived and aligned at saved carrier position.");
+        }
+    }
+}
+
+string FindAsteroidCarrierGps(int asteroidNum)
+{
+    string label = asteroidNum.ToString("D3");
+    IMyTimerBlock zoneDb = FindZoneDbTimer();
+    if (zoneDb == null) return null;
+
+    string[] lines = (zoneDb.CustomData ?? "").Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+    for (int i = 0; i < lines.Length - 1; i++)
+    {
+        if (lines[i].Trim() == label)
+            return lines[i + 1].Trim();
+    }
+    return null;
+}
+
+bool LineSegmentIntersectsSphere(Vector3D p0, Vector3D p1, Vector3D center, double radius)
+{
+    Vector3D d  = p1 - p0;
+    Vector3D oc = p0 - center;
+    double a    = d.LengthSquared();
+    if (a < 1e-12) return Vector3D.DistanceSquared(p0, center) < radius * radius;
+    double b    = 2.0 * Vector3D.Dot(oc, d);
+    double c    = oc.LengthSquared() - radius * radius;
+    double disc = b * b - 4 * a * c;
+    if (disc < 0) return false;
+    double sq   = Math.Sqrt(disc);
+    double t1   = (-b - sq) / (2 * a);
+    double t2   = (-b + sq) / (2 * a);
+    return t2 >= 0 && t1 <= 1;
+}
+
+void SendNavCommand(string command)
+{
+    var allPbs = new List<IMyProgrammableBlock>();
+    GridTerminalSystem.GetBlocksOfType(allPbs);
+    foreach (var pb in allPbs)
+    {
+        if (pb == Me) continue;
+        if (pb.CustomName.IndexOf(navPbTag, StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            pb.TryRun(command);
+            Echo($"Sent '{command}' to '{pb.CustomName}'.");
+            return;
+        }
+    }
+    Echo($"GoTo: navigation PB '{navPbTag}' not found.");
+}
+
 // Extracts only the path lines for the given asteroid number from a DB timer's CustomData.
 // Path lines are stored after the second separator line ("---...") in each asteroid record.
 List<string> ExtractAsteroidPathLines(string dbContent, int asteroidNum)
@@ -920,6 +1119,12 @@ void SaveState()
     sb.AppendLine("pathCount="          + pathRecords.Count);
     for (int i = 0; i < pathRecords.Count; i++)
         sb.AppendLine("pathRecord" + i + "=" + pathRecords[i]);
+    sb.AppendLine("goToMode="          + (goToMode ? "1" : "0"));
+    sb.AppendLine("goToPhase="         + goToPhase);
+    sb.AppendLine("goToIntermediate="  + V3ToString(goToIntermediate));
+    sb.AppendLine("goToFinalPos="      + V3ToString(goToFinalPos));
+    sb.AppendLine("goToFinalFwd="      + V3ToString(goToFinalFwd));
+    sb.AppendLine("goToFinalUp="       + V3ToString(goToFinalUp));
     Storage = sb.ToString();
 }
 
@@ -962,6 +1167,13 @@ void LoadState()
                 pathRecords.Add(s);
         }
     }
+
+    if (dict.TryGetValue("goToMode",         out s)) goToMode         = s == "1";
+    if (dict.TryGetValue("goToPhase",        out s) && int.TryParse(s, out n)) goToPhase = n;
+    if (dict.TryGetValue("goToIntermediate", out s) && TryParseV3(s, out v)) goToIntermediate = v;
+    if (dict.TryGetValue("goToFinalPos",     out s) && TryParseV3(s, out v)) goToFinalPos     = v;
+    if (dict.TryGetValue("goToFinalFwd",     out s) && TryParseV3(s, out v)) goToFinalFwd     = v;
+    if (dict.TryGetValue("goToFinalUp",      out s) && TryParseV3(s, out v)) goToFinalUp      = v;
 }
 
 // ---- Parse helpers ----
