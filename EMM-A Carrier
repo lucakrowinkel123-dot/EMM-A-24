@@ -1093,7 +1093,7 @@ class GyroControl
         for (int i = 0; i < gyros.Count; i++)
         {
             IMyGyro g = gyros[i];
-            if (g == null) { gyros.RemoveAtFast(i); continue; }
+            if (g == null) { gyros.RemoveAtFast(i); i--; continue; }
             g.GyroOverride = false;
         }
         anglePID.Reset();
