@@ -4,8 +4,9 @@
 // ============= Commands ==============
 // Nav;GPS:Name:X:Y:Z:|Ux,Uy,Uz,Fx,Fy,Fz : set target position and orientation vectors
 // Nav;GPS:Name:X:Y:Z:|Faceup,Faceforward  : auto-derive up/forward toward target
-// stop         : disable autopilot and release controls
+// stop         : disable autopilot and release controls (keeps broadcasting)
 // start        : enable autopilot (requires a target)
+// reset        : clear nav target, autopilot, and path state; release controls
 // clear        : clear target and all path state
 // dumpgps      : save current GPS + orientation to Custom Data
 // pathstart    : load records from "Carrier Path" timer and execute row-by-row
@@ -282,10 +283,24 @@ void RemoteCommand(string command)
     switch (trimmed.ToLower())
     {
         case "stop":
-            Runtime.UpdateFrequency = UpdateFrequency.None;
             ResetMovement();
             autopilotEnabled = false;
             Echo("Stopped.");
+            break;
+        case "reset":
+            hasTarget           = false;
+            targetPosition      = Vector3D.Zero;
+            desiredForward      = Vector3D.Zero;
+            desiredUp           = Vector3D.Zero;
+            activeMaxSpeed      = 0;
+            autopilotEnabled    = false;
+            pathMode            = false;
+            pathPaused          = false;
+            pathPausedNavResume = false;
+            pathRecords.Clear();
+            pathIndex           = 0;
+            ResetMovement();
+            Echo("Reset.");
             break;
         case "start":
             Runtime.UpdateFrequency = tickSpeed;
