@@ -861,7 +861,7 @@ string FormatCurrentGps(string name)
 void SavePathGpsRecord()
 {
     pathRecordCounter++;
-    string idx = pathRecordCounter.ToString("000");
+    string idx = pathRecordCounter.ToString("D4");
     string line = FormatCurrentGps(idx);
     if (AppendPathRecordLine(line))
         Echo($"Path point saved: {idx}");
@@ -2235,12 +2235,12 @@ void LoadState()
     if (dict.TryGetValue("desiredForward", out s) && TryParseV3(s, out v)) desiredForward = v;
     if (dict.TryGetValue("desiredUp", out s) && TryParseV3(s, out v)) desiredUp = v;
     if (dict.TryGetValue("miningEnabled", out s)) miningEnabled = s == "1";
-    if (dict.TryGetValue("miningState", out s) && int.TryParse(s, out n)) miningState = (MiningState)n;
+    if (dict.TryGetValue("miningState", out s) && int.TryParse(s, out n) && Enum.IsDefined(typeof(MiningState), n)) miningState = (MiningState)n;
     if (dict.TryGetValue("laneAnchor", out s) && TryParseV3(s, out v)) laneAnchor = v;
     if (dict.TryGetValue("drillAxis", out s) && TryParseV3(s, out v)) drillAxis = v;
     if (dict.TryGetValue("laneDepth", out s) && double.TryParse(s, out d)) laneDepth = d;
     if (dict.TryGetValue("activeMaxSpeed", out s) && double.TryParse(s, out d)) activeMaxSpeed = d;
-    if (dict.TryGetValue("depthMode", out s) && int.TryParse(s, out n)) depthMode = (DepthMode)n;
+    if (dict.TryGetValue("depthMode", out s) && int.TryParse(s, out n) && Enum.IsDefined(typeof(DepthMode), n)) depthMode = (DepthMode)n;
     if (dict.TryGetValue("areaMiningMode", out s)) areaMiningMode = s == "1";
     if (dict.TryGetValue("areaLaneIndex", out s) && int.TryParse(s, out n)) areaLaneIndex = n;
     if (dict.TryGetValue("retryLane", out s)) retryCurrentLane = s == "1";
@@ -2257,6 +2257,8 @@ void LoadState()
                 areaLaneAnchors.Add(v);
         }
     }
+    if (areaLaneIndex >= areaLaneAnchors.Count)
+        areaLaneIndex = 0;
 
     if (dict.TryGetValue("pathMode", out s)) pathMode = s == "1";
     if (dict.TryGetValue("pathPaused", out s)) pathPaused = s == "1";
@@ -2460,6 +2462,7 @@ class GyroControl
             if (g == null)
             {
                 gyros.RemoveAtFast(i);
+                i--;
                 continue;
             }
             g.GyroOverride = false;
