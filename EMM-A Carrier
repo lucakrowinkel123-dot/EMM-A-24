@@ -70,6 +70,9 @@ int pathIndex            = 0;
 double secondsPerTick  = 1.0 / 60.0;
 readonly int echoFrequency = 100;
 int runtime            = 0;
+int _broadcastTick     = 0;
+string _notification   = "";
+int _notificationDisplays = 0;
 IMyTimerBlock _cachedPathTimer;
 IMyTimerBlock _cachedZoneDbTimer;
 
@@ -111,7 +114,7 @@ public void Main(string argument, UpdateType updateSource)
         if (carrierConnector == null)
             carrierConnector = GridTerminalSystem.GetBlockWithName(carrierConnectorName) as IMyShipConnector;
 
-        BroadcastDockPose();
+        if (_broadcastTick++ % 6 == 0) BroadcastDockPose();
 
         if (runtime % echoFrequency == 0)
         {
@@ -170,7 +173,18 @@ void WriteEcho()
         sb.AppendLine($"Path: {Math.Min(pathIndex + 1, pathRecords.Count)}/{pathRecords.Count}" + (pathPaused ? " (paused)" : ""));
     sb.AppendLine($"Connector: {(carrierConnector != null ? carrierConnector.CustomName : "<missing>")}");
     sb.AppendLine("Dock broadcast: " + dockBroadcastTag);
+    if (_notificationDisplays > 0)
+    {
+        sb.AppendLine(">> " + _notification);
+        _notificationDisplays--;
+    }
     Echo(sb.ToString());
+}
+
+void Notify(string msg, int displays = 3)
+{
+    _notification = msg;
+    _notificationDisplays = displays;
 }
 
 void Move()
@@ -252,7 +266,7 @@ void RemoteCommand(string command)
         string navArgs = trimmed.Substring(4).Trim();
         if (!TryParseGpsCommand(navArgs, out targetPosition, out desiredForward, out desiredUp))
         {
-            Echo("Invalid Nav command. Use: Nav;GPS:Name:X:Y:Z:|Faceup,Faceforward");
+            Notify("Invalid Nav command. Use: Nav;GPS:Name:X:Y:Z:|Faceup,Faceforward");
             return;
         }
         hasTarget        = true;
@@ -267,10 +281,10 @@ void RemoteCommand(string command)
         if (TryParseVector3(trimmed.Substring(5).Trim(), out off))
         {
             TOFFR = off.X; TOFFU = off.Y; TOFFF = off.Z;
-            Echo($"TOFF set. R/U/F = {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
+            Notify($"TOFF set. R/U/F = {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
         }
         else
-            Echo("Invalid TOFF. Use: TOFF r,u,f");
+            Notify("Invalid TOFF. Use: TOFF r,u,f");
         return;
     }
 
@@ -285,7 +299,7 @@ void RemoteCommand(string command)
         case "stop":
             ResetMovement();
             autopilotEnabled = false;
-            Echo("Stopped.");
+            Notify("Stopped.");
             break;
         case "reset":
             hasTarget           = false;
@@ -300,7 +314,7 @@ void RemoteCommand(string command)
             pathRecords.Clear();
             pathIndex           = 0;
             ResetMovement();
-            Echo("Reset.");
+            Notify("Reset.");
             break;
         case "start":
             Runtime.UpdateFrequency = tickSpeed;
@@ -328,7 +342,7 @@ void RemoteCommand(string command)
             break;
         case "pathpause":
             if (!pathMode)
-                Echo("Path mode is not active.");
+                Notify("Path mode is not active.");
             else
             {
                 pathPaused = true;
@@ -336,19 +350,19 @@ void RemoteCommand(string command)
                 {
                     autopilotEnabled    = false;
                     pathPausedNavResume = true;
-                    Echo("Path mode paused. Movement halted.");
+                    Notify("Path mode paused. Movement halted.");
                 }
                 else
-                    Echo("Path mode paused.");
+                    Notify("Path mode paused.");
             }
             break;
         case "pathcontinue":
             if (!pathMode)
-                Echo("Path mode is not active.");
+                Notify("Path mode is not active.");
             else
             {
                 pathPaused = false;
-                Echo("Path mode resumed.");
+                Notify("Path mode resumed.");
                 if (pathPausedNavResume && hasTarget)
                 {
                     autopilotEnabled    = true;
@@ -364,11 +378,11 @@ void RemoteCommand(string command)
             pathPausedNavResume = false;
             pathRecords.Clear();
             pathIndex = 0;
-            Echo("Path mode stopped.");
+            Notify("Path mode stopped.");
             break;
         case "toffreset":
             TOFFR = 0; TOFFU = 0; TOFFF = 0;
-            Echo("TOFF reset to 0,0,0.");
+            Notify("TOFF reset to 0,0,0.");
             break;
         case "saveasteroid":
             SaveAsteroid();
@@ -401,7 +415,7 @@ void StartPathFromTimer()
     string timerName;
     if (!TryLoadPathRecordsFromTimer(out loaded, out timerName))
     {
-        Echo($"Unable to load path records from timer tag '{pathTimerTag}'.");
+        Notify($"Unable to load path records from timer tag '{pathTimerTag}'.");
         return;
     }
 
@@ -410,7 +424,7 @@ void StartPathFromTimer()
     pathMode            = true;
     pathPaused          = false;
     pathPausedNavResume = false;
-    Echo($"Loaded {pathRecords.Count} records from timer '{timerName}'.");
+    Notify($"Loaded {pathRecords.Count} records from timer '{timerName}'.");
     StartNextPathRecord();
 }
 
@@ -422,13 +436,13 @@ void StartNextPathRecord()
         pathIndex++;
         if (ExecutePathRecord(record))
             return;
-        Echo($"Skipping invalid path record #{pathIndex}.");
+        Notify($"Skipping invalid path record #{pathIndex}.");
     }
 
     if (pathMode && pathIndex >= pathRecords.Count)
     {
         pathMode = false;
-        Echo("Path execution complete.");
+        Notify("Path execution complete.");
     }
 }
 
@@ -525,19 +539,19 @@ void DumpCurrentGpsToCustomData()
     sb.AppendLine("[AutopilotDump]");
     sb.AppendLine(FormatCurrentGps("Here"));
     Me.CustomData = sb.ToString();
-    Echo("Dumped GPS/orientation to Custom Data.");
+    Notify("Dumped GPS/orientation to Custom Data.");
 }
 
 // ---- SaveAsteroid ----
 
 void SaveAsteroid()
 {
-    Echo("SaveAsteroid: simulating recompile...");
+    Notify("SaveAsteroid: simulating recompile...");
     SimulateRecompile();
 
     if (rc == null)
     {
-        Echo("SaveAsteroid: no remote control found after recompile. Aborting.");
+        Notify("SaveAsteroid: no remote control found after recompile. Aborting.");
         return;
     }
 
@@ -547,7 +561,7 @@ void SaveAsteroid()
     int dbIndex       = (asteroidNum - 1) / asteroidsPerDb + 1;
     string dbTimerName = asteroidDbTagPfx + dbIndex.ToString("D2");
 
-    Echo($"SaveAsteroid: saving Asteroid {label} -> {dbTimerName}");
+    Notify($"SaveAsteroid: saving Asteroid {label} -> {dbTimerName}");
 
     // Carrier position and orientation from RC
     string carrierGps = FormatCarrierGps();
@@ -589,7 +603,7 @@ void SaveAsteroid()
     IMyTimerBlock dbTimer = FindTimerByTag(dbTimerName);
     if (dbTimer == null)
     {
-        Echo($"SaveAsteroid: timer '{dbTimerName}' not found. Aborting.");
+        Notify($"SaveAsteroid: timer '{dbTimerName}' not found. Aborting.");
         return;
     }
     string existingDb = dbTimer.CustomData ?? "";
@@ -600,7 +614,7 @@ void SaveAsteroid()
     // Update the Zone DB
     UpdateZoneDb(asteroidNum, dbTimerName, carrierGps);
 
-    Echo($"SaveAsteroid: Asteroid {label} saved. Zone DB updated.");
+    Notify($"SaveAsteroid: Asteroid {label} saved. Zone DB updated.");
     SendMinerCommand("PathClear");
 }
 
@@ -623,7 +637,7 @@ void SimulateRecompile()
 
     _cachedPathTimer   = null;
     _cachedZoneDbTimer = null;
-    Echo("SaveAsteroid: recompile done.");
+    Notify("SaveAsteroid: recompile done.");
 }
 
 // Scans all Asteroid DB timers to find the highest saved asteroid number, then returns +1.
@@ -750,7 +764,7 @@ List<string> ReadMinerPathLines()
     IMyTimerBlock timer = FindMinerPathTimer();
     if (timer == null)
     {
-        Echo($"SaveAsteroid: miner path timer '{minerPathTimerTag}' not found.");
+        Notify($"SaveAsteroid: miner path timer '{minerPathTimerTag}' not found.");
         return lines;
     }
     foreach (string line in (timer.CustomData ?? "").Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries))
@@ -773,11 +787,11 @@ void SendMinerCommand(string command)
         if (pb.CustomName.IndexOf(minerPbTag, StringComparison.OrdinalIgnoreCase) >= 0)
         {
             pb.TryRun(command);
-            Echo($"Sent '{command}' to '{pb.CustomName}'.");
+            Notify($"Sent '{command}' to '{pb.CustomName}'.");
             return;
         }
     }
-    Echo($"SendMinerCommand: miner PB '{minerPbTag}' not found.");
+    Notify($"SendMinerCommand: miner PB '{minerPbTag}' not found.");
 }
 
 // Loads the path records of a saved asteroid into the miner's Path timer.
@@ -787,13 +801,13 @@ void LoadAsteroid(string argument)
     string[] parts = argument.Split(new[] { ' ' }, 2, StringSplitOptions.RemoveEmptyEntries);
     if (parts.Length < 2)
     {
-        Echo("Usage: LoadAsteroid <number>  e.g. LoadAsteroid 002");
+        Notify("Usage: LoadAsteroid <number>  e.g. LoadAsteroid 002");
         return;
     }
     int asteroidNum;
     if (!int.TryParse(parts[1].Trim(), out asteroidNum) || asteroidNum < 1)
     {
-        Echo($"LoadAsteroid: invalid number '{parts[1].Trim()}'.");
+        Notify($"LoadAsteroid: invalid number '{parts[1].Trim()}'.");
         return;
     }
     string label = asteroidNum.ToString("D3");
@@ -803,21 +817,21 @@ void LoadAsteroid(string argument)
     IMyTimerBlock dbTimer = FindTimerByTag(dbTimerName);
     if (dbTimer == null)
     {
-        Echo($"LoadAsteroid: DB timer '{dbTimerName}' not found.");
+        Notify($"LoadAsteroid: DB timer '{dbTimerName}' not found.");
         return;
     }
 
     List<string> pathLines = ExtractAsteroidPathLines(dbTimer.CustomData ?? "", asteroidNum);
     if (pathLines.Count == 0)
     {
-        Echo($"LoadAsteroid: no path data found for Asteroid {label} in '{dbTimerName}'.");
+        Notify($"LoadAsteroid: no path data found for Asteroid {label} in '{dbTimerName}'.");
         return;
     }
 
     IMyTimerBlock pathTimer = FindMinerPathTimer();
     if (pathTimer == null)
     {
-        Echo($"LoadAsteroid: miner path timer '{minerPathTimerTag}' not found.");
+        Notify($"LoadAsteroid: miner path timer '{minerPathTimerTag}' not found.");
         return;
     }
 
@@ -826,7 +840,7 @@ void LoadAsteroid(string argument)
         sb.AppendLine(line);
     pathTimer.CustomData = sb.ToString();
 
-    Echo($"LoadAsteroid: Asteroid {label} loaded to miner path timer ({pathLines.Count} records).");
+    Notify($"LoadAsteroid: Asteroid {label} loaded to miner path timer ({pathLines.Count} records).");
 }
 
 // Extracts only the path lines for the given asteroid number from a DB timer's CustomData.
@@ -875,7 +889,7 @@ void UpdateZoneDb(int asteroidNum, string dbTimerName, string carrierGps)
     IMyTimerBlock zoneDb = FindZoneDbTimer();
     if (zoneDb == null)
     {
-        Echo($"SaveAsteroid: Zone DB timer '{zoneDbTimerTag}' not found. Skipping.");
+        Notify($"SaveAsteroid: Zone DB timer '{zoneDbTimerTag}' not found. Skipping.");
         return;
     }
 
