@@ -558,8 +558,6 @@ void RemoteCommand (string command)
             SetCockpitGyroControl(true);
             activeMaxSpeed = 0;
             SetMineIndicatorSensor(false);
-            if (!IsMergerDocked())
-                SetMergerEnabled(false);
             SetDrills(false);
             ResetMovement();
             WriteEcho();
